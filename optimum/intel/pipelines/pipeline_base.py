@@ -29,7 +29,6 @@ from transformers import (
     ImageToTextPipeline,
     Pipeline,
     PreTrainedTokenizer,
-    PreTrainedTokenizerFast,
     QuestionAnsweringPipeline,
     SummarizationPipeline,
     Text2TextGenerationPipeline,
@@ -49,7 +48,6 @@ from optimum.intel.utils.import_utils import (
     is_ipex_available,
     is_openvino_available,
 )
-from optimum.intel.utils.modeling_utils import _find_files_matching_pattern
 
 
 if is_ipex_available():
@@ -60,6 +58,7 @@ if is_ipex_available():
         IPEXModelForImageClassification,
         IPEXModelForMaskedLM,
         IPEXModelForQuestionAnswering,
+        IPEXModelForSeq2SeqLM,
         IPEXModelForSequenceClassification,
         IPEXModelForTokenClassification,
     )
@@ -69,6 +68,24 @@ if is_ipex_available():
             "impl": TextGenerationPipeline,
             "class": (IPEXModelForCausalLM,),
             "default": "gpt2",
+            "type": "text",
+        },
+        "summarization": {
+            "impl": SummarizationPipeline,
+            "class": (IPEXModelForSeq2SeqLM,),
+            "default": "t5-base",
+            "type": "text",
+        },
+        "translation": {
+            "impl": TranslationPipeline,
+            "class": (IPEXModelForSeq2SeqLM,),
+            "default": "t5-small",
+            "type": "text",
+        },
+        "text2text-generation": {
+            "impl": Text2TextGenerationPipeline,
+            "class": (IPEXModelForSeq2SeqLM,),
+            "default": "t5-small",
             "type": "text",
         },
         "fill-mask": {
@@ -229,20 +246,9 @@ def load_openvino_model(
     model_kwargs = model_kwargs or {}
     ov_model_class = SUPPORTED_TASKS[targeted_task]["class"][0]
 
-    if model is None:
-        model_id = SUPPORTED_TASKS[targeted_task]["default"]
-        model = ov_model_class.from_pretrained(model_id, export=True, **hub_kwargs, **model_kwargs)
-    elif isinstance(model, str):
-        model_id = model
-        pattern = r"(.*)?openvino(.*)?\_model.xml"
-        ov_files = _find_files_matching_pattern(
-            model,
-            pattern,
-            use_auth_token=hub_kwargs.get("token", None),
-            revision=hub_kwargs.get("revision", None),
-        )
-        export = len(ov_files) == 0
-        model = ov_model_class.from_pretrained(model, export=export, **hub_kwargs, **model_kwargs)
+    if isinstance(model, str) or model is None:
+        model_id = model or SUPPORTED_TASKS[targeted_task]["default"]
+        model = ov_model_class.from_pretrained(model_id, **hub_kwargs, **model_kwargs)
     elif isinstance(model, OVBaseModel):
         model_id = model.model_save_dir
     else:
@@ -259,6 +265,7 @@ def load_ipex_model(
     SUPPORTED_TASKS,
     hub_kwargs: Optional[Dict[str, Any]] = None,
     model_kwargs: Optional[Dict[str, Any]] = None,
+    device_map: Optional[torch.device] = None,
 ):
     hub_kwargs = hub_kwargs or {}
     model_kwargs = model_kwargs or {}
@@ -266,7 +273,9 @@ def load_ipex_model(
 
     if model is None:
         model_id = SUPPORTED_TASKS[targeted_task]["default"]
-        model = ipex_model_class.from_pretrained(model_id, export=True, **hub_kwargs, **model_kwargs)
+        model = ipex_model_class.from_pretrained(
+            model_id, export=True, **hub_kwargs, **model_kwargs, device_map=device_map
+        )
     elif isinstance(model, str):
         model_id = model
         try:
@@ -275,7 +284,9 @@ def load_ipex_model(
         except RuntimeError:
             logger.warning("We will use IPEXModel with export=True to export the model")
             export = True
-        model = ipex_model_class.from_pretrained(model, export=export, **hub_kwargs, **model_kwargs)
+        model = ipex_model_class.from_pretrained(
+            model, export=export, **hub_kwargs, **model_kwargs, device_map=device_map
+        )
     elif isinstance(model, IPEXModel):
         model_id = getattr(model.config, "name_or_path", None)
     else:

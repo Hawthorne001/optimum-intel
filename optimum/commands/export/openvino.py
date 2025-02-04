@@ -13,18 +13,17 @@
 # limitations under the License.
 """Defines the command line for the export with OpenVINO."""
 
-import json
 import logging
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
-from transformers.utils.quantization_config import QuantizationMethod
 
 from ...exporters import TasksManager
 from ...intel.utils.import_utils import DIFFUSERS_IMPORT_ERROR, is_diffusers_available
-from ...utils.save_utils import maybe_load_preprocessors, maybe_save_preprocessors
+from ...intel.utils.modeling_utils import _infer_library_from_model_name_or_path
+from ...utils.save_utils import maybe_load_preprocessors
 from ..base import BaseOptimumCLICommand, CommandInfo
 
 
@@ -53,9 +52,6 @@ def parse_args_openvino(parser: "ArgumentParser"):
         ),
     )
     optional_group.add_argument(
-        "--cache_dir", type=str, default=HUGGINGFACE_HUB_CACHE, help="Path indicating where to store cache."
-    )
-    optional_group.add_argument(
         "--framework",
         type=str,
         choices=["pt", "tf"],
@@ -73,6 +69,35 @@ def parse_args_openvino(parser: "ArgumentParser"):
         ),
     )
     optional_group.add_argument(
+        "--weight-format",
+        type=str,
+        choices=["fp32", "fp16", "int8", "int4", "mxfp4", "nf4"],
+        default=None,
+        help="The weight format of the exported model.",
+    )
+    optional_group.add_argument(
+        "--quant-mode",
+        type=str,
+        choices=["int8", "f8e4m3", "f8e5m2"],
+        default=None,
+        help=(
+            "Quantization precision mode. This is used for applying full model quantization including activations. "
+        ),
+    )
+    optional_group.add_argument(
+        "--library",
+        type=str,
+        choices=["transformers", "diffusers", "timm", "sentence_transformers", "open_clip"],
+        default=None,
+        help="The library used to load the model before export. If not provided, will attempt to infer the local checkpoint's library",
+    )
+    optional_group.add_argument(
+        "--cache_dir",
+        type=str,
+        default=HUGGINGFACE_HUB_CACHE,
+        help="The path to a directory in which the downloaded model should be cached if the standard cache should not be used.",
+    )
+    optional_group.add_argument(
         "--pad-token-id",
         type=int,
         default=None,
@@ -80,24 +105,20 @@ def parse_args_openvino(parser: "ArgumentParser"):
             "This is needed by some models, for some tasks. If not provided, will attempt to use the tokenizer to guess it."
         ),
     )
-    optional_group.add_argument("--fp16", action="store_true", help="Compress weights to fp16")
-    optional_group.add_argument("--int8", action="store_true", help="Compress weights to int8")
     optional_group.add_argument(
-        "--weight-format",
+        "--variant",
         type=str,
-        choices=["fp32", "fp16", "int8", "int4", "int4_sym_g128", "int4_asym_g128", "int4_sym_g64", "int4_asym_g64"],
         default=None,
-        help=(
-            "The weight format of the exporting model, e.g. f32 stands for float32 weights, f16 - for float16 weights, i8 - INT8 weights, int4_* - for INT4 compressed weights."
-        ),
+        help=("If specified load weights from variant filename."),
     )
     optional_group.add_argument(
         "--ratio",
         type=float,
         default=None,
         help=(
-            "Compression ratio between primary and backup precision. In the case of INT4, NNCF evaluates layer sensitivity and keeps the most impactful layers in INT8"
-            "precision (by default 20%% in INT8). This helps to achieve better accuracy after weight compression."
+            "A parameter used when applying 4-bit quantization to control the ratio between 4-bit and 8-bit quantization. If set to 0.8, 80%% of the layers will be quantized to int4 "
+            "while 20%% will be quantized to int8. This helps to achieve better accuracy at the sacrifice of the model size and inference latency. Default value is 1.0. "
+            "Note: If dataset is provided, and the ratio is less than 1.0, then data-aware mixed precision assignment will be applied."
         ),
     )
     optional_group.add_argument(
@@ -113,13 +134,31 @@ def parse_args_openvino(parser: "ArgumentParser"):
         help=("The group size to use for quantization. Recommended value is 128 and -1 uses per-column quantization."),
     )
     optional_group.add_argument(
+        "--backup-precision",
+        type=str,
+        choices=["none", "int8_sym", "int8_asym"],
+        default=None,
+        help=(
+            "Defines a backup precision for mixed-precision weight compression. Only valid for 4-bit weight formats. "
+            "If not provided, backup precision is int8_asym. 'none' stands for original floating-point precision of "
+            "the model weights, in this case weights are retained in their original precision without any "
+            "quantization. 'int8_sym' stands for 8-bit integer symmetric quantization without zero point. 'int8_asym' "
+            "stands for 8-bit integer asymmetric quantization with zero points per each quantization group."
+        ),
+    )
+    optional_group.add_argument(
         "--dataset",
         type=str,
         default=None,
         help=(
             "The dataset used for data-aware compression or quantization with NNCF. "
-            "You can use the one from the list ['wikitext2','c4','c4-new','ptb','ptb-new'] for LLLMs "
-            "or ['conceptual_captions','laion/220k-GPT4Vision-captions-from-LIVIS','laion/filtered-wit'] for diffusion models."
+            "For language models you can use the one from the list ['auto','wikitext2','c4','c4-new']. With 'auto' the "
+            "dataset will be collected from model's generations. "
+            "For diffusion models it should be on of ['conceptual_captions',"
+            "'laion/220k-GPT4Vision-captions-from-LIVIS','laion/filtered-wit']. "
+            "For visual language models the dataset must be set to 'contextual'. "
+            "Note: if none of the data-aware compression algorithms are selected and ratio parameter is omitted or "
+            "equals 1.0, the dataset argument will not have an effect on the resulting model."
         ),
     )
     optional_group.add_argument(
@@ -138,8 +177,38 @@ def parse_args_openvino(parser: "ArgumentParser"):
         help=(
             "Whether to apply AWQ algorithm. AWQ improves generation quality of INT4-compressed LLMs, but requires "
             "additional time for tuning weights on a calibration dataset. To run AWQ, please also provide a dataset "
-            "argument. Note: it's possible that there will be no matching patterns in the model to apply AWQ, in such "
+            "argument. Note: it is possible that there will be no matching patterns in the model to apply AWQ, in such "
             "case it will be skipped."
+        ),
+    )
+    optional_group.add_argument(
+        "--scale-estimation",
+        action="store_true",
+        default=None,
+        help=(
+            "Indicates whether to apply a scale estimation algorithm that minimizes the L2 error between the original "
+            "and compressed layers. Providing a dataset is required to run scale estimation. Please note, that "
+            "applying scale estimation takes additional memory and time."
+        ),
+    )
+    optional_group.add_argument(
+        "--gptq",
+        action="store_true",
+        default=None,
+        help=(
+            "Indicates whether to apply GPTQ algorithm that optimizes compressed weights in a layer-wise fashion to "
+            "minimize the difference between activations of a compressed and original layer. Please note, that "
+            "applying GPTQ takes additional memory and time."
+        ),
+    )
+    optional_group.add_argument(
+        "--lora-correction",
+        action="store_true",
+        default=None,
+        help=(
+            "Indicates whether to apply LoRA Correction algorithm. When enabled, this algorithm introduces low-rank "
+            "adaptation layers in the model that can recover accuracy after weight compression at some cost of "
+            "inference latency. Please note, that applying LoRA Correction algorithm takes additional memory and time."
         ),
     )
     optional_group.add_argument(
@@ -147,7 +216,7 @@ def parse_args_openvino(parser: "ArgumentParser"):
         type=str,
         default=None,
         help=(
-            "The sensitivity metric for assigning quantization precision to layers. Can be one of the following: "
+            "The sensitivity metric for assigning quantization precision to layers. It can be one of the following: "
             "['weight_quantization_error', 'hessian_input_activation', 'mean_activation_variance', "
             "'max_activation_variance', 'mean_activation_magnitude']."
         ),
@@ -166,7 +235,7 @@ def parse_args_openvino(parser: "ArgumentParser"):
             "In stateful models all kv-cache inputs and outputs are hidden in the model and are not exposed as model inputs and outputs. "
             "If --disable-stateful option is used, it may result in sub-optimal inference performance. "
             "Use it when you intentionally want to use a stateless model, for example, to be compatible with existing "
-            "OpenVINO native inference code that expects kv-cache inputs and outputs in the model."
+            "OpenVINO native inference code that expects KV-cache inputs and outputs in the model."
         ),
     )
     optional_group.add_argument(
@@ -175,17 +244,49 @@ def parse_args_openvino(parser: "ArgumentParser"):
         help="Do not add converted tokenizer and detokenizer OpenVINO models.",
     )
     optional_group.add_argument(
-        "--convert-tokenizer",
-        action="store_true",
-        help="[Deprecated] Add converted tokenizer and detokenizer with OpenVINO Tokenizers.",
+        "--smooth-quant-alpha",
+        type=float,
+        default=None,
+        help=(
+            "SmoothQuant alpha parameter that improves the distribution of activations before MatMul layers and "
+            "reduces quantization error. Valid only when activations quantization is enabled."
+        ),
     )
 
-    optional_group.add_argument(
-        "--library",
-        type=str,
-        choices=["transformers", "diffusers", "timm", "sentence_transformers"],
-        default=None,
-        help=("The library on the model. If not provided, will attempt to infer the local checkpoint's library"),
+
+def no_compression_parameter_provided(args):
+    return all(
+        (
+            it is None
+            for it in (
+                args.ratio,
+                args.group_size,
+                args.sym,
+                args.all_layers,
+                args.dataset,
+                args.num_samples,
+                args.awq,
+                args.scale_estimation,
+                args.gptq,
+                args.lora_correction,
+                args.sensitivity_metric,
+                args.backup_precision,
+            )
+        )
+    )
+
+
+def no_quantization_parameter_provided(args):
+    return all(
+        (
+            it is None
+            for it in (
+                args.sym,
+                args.dataset,
+                args.num_samples,
+                args.smooth_quant_alpha,
+            )
+        )
     )
 
 
@@ -211,92 +312,84 @@ class OVExportCommand(BaseOptimumCLICommand):
 
     def run(self):
         from ...exporters.openvino.__main__ import infer_task, main_export, maybe_convert_tokenizers
-        from ...intel.openvino.configuration import _DEFAULT_4BIT_CONFIGS, OVConfig
+        from ...exporters.openvino.utils import save_preprocessors
+        from ...intel.openvino.configuration import _DEFAULT_4BIT_CONFIG, OVConfig, get_default_int4_config
 
-        def _get_default_int4_config(model_id_or_path, library_name):
-            if model_id_or_path in _DEFAULT_4BIT_CONFIGS:
-                return _DEFAULT_4BIT_CONFIGS[model_id_or_path]
-            if "transformers" in library_name and (Path(model_id_or_path) / "config.json").exists():
-                with (Path(model_id_or_path) / "config.json").open("r") as config_f:
-                    config = json.load(config_f)
-                    original_model_name = config.get("_name_or_path", "")
-                if original_model_name in _DEFAULT_4BIT_CONFIGS:
-                    return _DEFAULT_4BIT_CONFIGS[original_model_name]
-
-            return {
-                "bits": 4,
-                "ratio": 0.8,
-                "sym": False,
-                "group_size": None,
-                "all_layers": None,
-            }
-
-        library_name = TasksManager.infer_library_from_model(self.args.model, library_name=self.args.library)
-        if library_name == "sentence_transformers" and self.args.library is None:
-            logger.warning(
-                "Library name is not specified. There are multiple possible variants: `sentence_transformers`, `transformers`."
-                "`transformers` will be selected. If you want to load your model with the `sentence-transformers` library instead, please set --library sentence_transformers"
+        if self.args.library is None:
+            # TODO: add revision, subfolder and token to args
+            library_name = _infer_library_from_model_name_or_path(
+                model_name_or_path=self.args.model, cache_dir=self.args.cache_dir
             )
-            library_name = "transformers"
+            if library_name == "sentence_transformers":
+                logger.warning(
+                    "Library name is not specified. There are multiple possible variants: `sentence_transformers`, `transformers`."
+                    "`transformers` will be selected. If you want to load your model with the `sentence-transformers` library instead, please set --library sentence_transformers"
+                )
+                library_name = "transformers"
+        else:
+            library_name = self.args.library
 
-        if self.args.fp16:
-            logger.warning(
-                "`--fp16` option is deprecated and will be removed in a future version. Use `--weight-format` instead."
-            )
-            self.args.weight_format = "fp16"
-        if self.args.int8:
-            logger.warning(
-                "`--int8` option is deprecated and will be removed in a future version. Use `--weight-format` instead."
-            )
-            self.args.weight_format = "int8"
-
-        if self.args.weight_format is None:
+        if self.args.weight_format is None and self.args.quant_mode is None:
             ov_config = None
+            if not no_compression_parameter_provided(self.args):
+                raise ValueError(
+                    "Some compression parameters are provided, but the weight format is not specified. "
+                    "Please provide it with --weight-format argument."
+                )
+            if not no_quantization_parameter_provided(self.args):
+                raise ValueError(
+                    "Some quantization parameters are provided, but the quantization mode is not specified. "
+                    "Please provide it with --quant-mode argument."
+                )
         elif self.args.weight_format in {"fp16", "fp32"}:
             ov_config = OVConfig(dtype=self.args.weight_format)
-        else:
-            is_int8 = self.args.weight_format == "int8"
-
-            # For int4 quantization if not parameter is provided, then use the default config if exist
-            if (
-                not is_int8
-                and self.args.ratio is None
-                and self.args.group_size is None
-                and self.args.sym is None
-                and self.args.all_layers is None
-                and self.args.dataset is None
-                and self.args.num_samples is None
-                and self.args.awq is None
-                and self.args.sensitivity_metric is None
-            ):
-                quantization_config = _get_default_int4_config(self.args.model, library_name)
+        elif self.args.weight_format is not None:
+            # For int4 quantization if no parameter is provided, then use the default config if exists
+            if no_compression_parameter_provided(self.args) and self.args.weight_format == "int4":
+                quantization_config = get_default_int4_config(self.args.model)
             else:
+                is_int8 = self.args.weight_format == "int8"
                 quantization_config = {
                     "bits": 8 if is_int8 else 4,
-                    "ratio": 1 if is_int8 else (self.args.ratio or 0.8),
+                    "ratio": 1.0 if is_int8 else (self.args.ratio or _DEFAULT_4BIT_CONFIG["ratio"]),
                     "sym": self.args.sym or False,
                     "group_size": -1 if is_int8 else self.args.group_size,
                     "all_layers": None if is_int8 else self.args.all_layers,
                     "dataset": self.args.dataset,
                     "num_samples": self.args.num_samples,
-                    "quant_method": QuantizationMethod.AWQ if self.args.awq else None,
+                    "quant_method": "awq" if self.args.awq else "default",
                     "sensitivity_metric": self.args.sensitivity_metric,
+                    "scale_estimation": self.args.scale_estimation,
+                    "gptq": self.args.gptq,
+                    "lora_correction": self.args.lora_correction,
+                    "weight_format": self.args.weight_format,
+                    "backup_precision": self.args.backup_precision,
                 }
 
-            if self.args.weight_format in {"int4_sym_g128", "int4_asym_g128", "int4_sym_g64", "int4_asym_g64"}:
-                logger.warning(
-                    f"--weight-format {self.args.weight_format} is deprecated, possible choices are fp32, fp16, int8, int4"
-                )
-                quantization_config["sym"] = "asym" not in self.args.weight_format
-                quantization_config["group_size"] = 128 if "128" in self.args.weight_format else 64
+            if quantization_config.get("dataset", None) is not None:
+                quantization_config["trust_remote_code"] = self.args.trust_remote_code
             ov_config = OVConfig(quantization_config=quantization_config)
+        else:
+            if self.args.dataset is None:
+                raise ValueError(
+                    "Dataset is required for full quantization. Please provide it with --dataset argument."
+                )
 
-        if self.args.convert_tokenizer:
-            logger.warning("`--convert-tokenizer` option is deprecated. Tokenizer will be converted by default.")
+            quantization_config = {
+                "weight_format": self.args.quant_mode,
+                "activation_format": self.args.quant_mode,
+                "bits": 8,
+                "sym": self.args.sym or False,
+                "dataset": self.args.dataset,
+                "num_samples": self.args.num_samples,
+                "smooth_quant_alpha": self.args.smooth_quant_alpha,
+                "trust_remote_code": self.args.trust_remote_code,
+            }
+            ov_config = OVConfig(quantization_config=quantization_config)
 
         quantization_config = ov_config.quantization_config if ov_config else None
         quantize_with_dataset = quantization_config and getattr(quantization_config, "dataset", None) is not None
-        task = infer_task(self.args.task, self.args.model)
+        task = infer_task(self.args.task, self.args.model, library_name=library_name)
 
         if library_name == "diffusers" and quantize_with_dataset:
             if not is_diffusers_available():
@@ -320,32 +413,59 @@ class OVExportCommand(BaseOptimumCLICommand):
                 from optimum.intel import OVStableDiffusionPipeline
 
                 model_cls = OVStableDiffusionPipeline
+            elif class_name == "StableDiffusion3Pipeline":
+                from optimum.intel import OVStableDiffusion3Pipeline
+
+                model_cls = OVStableDiffusion3Pipeline
+            elif class_name == "FluxPipeline":
+                from optimum.intel import OVFluxPipeline
+
+                model_cls = OVFluxPipeline
+            elif class_name == "SanaPipeline":
+                from optimum.intel import OVSanaPipeline
+
+                model_cls = OVSanaPipeline
             else:
                 raise NotImplementedError(f"Quantization in hybrid mode isn't supported for class {class_name}.")
 
             model = model_cls.from_pretrained(self.args.model, export=True, quantization_config=quantization_config)
             model.save_pretrained(self.args.output)
             if not self.args.disable_convert_tokenizer:
-                maybe_convert_tokenizers(library_name, self.args.output, model)
-        elif task.startswith("text-generation") and quantize_with_dataset:
-            from optimum.intel import OVModelForCausalLM
+                maybe_convert_tokenizers(library_name, self.args.output, model, task=task)
+        elif (
+            quantize_with_dataset
+            and (task.startswith("text-generation") or task == "automatic-speech-recognition")
+            or (task == "image-text-to-text" and quantization_config is not None)
+        ):
+            if task.startswith("text-generation"):
+                from optimum.intel import OVModelForCausalLM
 
-            # To quantize a text-generation model with a dataset, an instantiated OVModelForCausalLM is required
-            model = OVModelForCausalLM.from_pretrained(
+                model_cls = OVModelForCausalLM
+            elif task == "image-text-to-text":
+                from optimum.intel import OVModelForVisualCausalLM
+
+                model_cls = OVModelForVisualCausalLM
+            else:
+                from optimum.intel import OVModelForSpeechSeq2Seq
+
+                model_cls = OVModelForSpeechSeq2Seq
+
+            # In this case, to apply quantization an instance of a model class is required
+            model = model_cls.from_pretrained(
                 self.args.model,
                 export=True,
                 quantization_config=quantization_config,
                 stateful=not self.args.disable_stateful,
                 trust_remote_code=self.args.trust_remote_code,
+                variant=self.args.variant,
+                cache_dir=self.args.cache_dir,
             )
             model.save_pretrained(self.args.output)
 
-            maybe_save_preprocessors(self.args.model, self.args.output, trust_remote_code=self.args.trust_remote_code)
+            preprocessors = maybe_load_preprocessors(self.args.model, trust_remote_code=self.args.trust_remote_code)
+            save_preprocessors(preprocessors, model.config, self.args.output, self.args.trust_remote_code)
             if not self.args.disable_convert_tokenizer:
-                preprocessors = maybe_load_preprocessors(
-                    self.args.model, trust_remote_code=self.args.trust_remote_code
-                )
-                maybe_convert_tokenizers(library_name, self.args.output, preprocessors=preprocessors)
+                maybe_convert_tokenizers(library_name, self.args.output, preprocessors=preprocessors, task=task)
         else:
             # TODO : add input shapes
             main_export(
@@ -360,5 +480,6 @@ class OVExportCommand(BaseOptimumCLICommand):
                 stateful=not self.args.disable_stateful,
                 convert_tokenizer=not self.args.disable_convert_tokenizer,
                 library_name=library_name,
+                variant=self.args.variant,
                 # **input_shapes,
             )

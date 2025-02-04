@@ -1,12 +1,12 @@
 <p align="center">
-    <img src="readme_logo.png" />
+    <img src="https://huggingface.co/datasets/optimum/documentation-images/resolve/main/intel/logo/hf_intel_logo.png" />
 </p>
 
 # Optimum Intel
 
 🤗 Optimum Intel is the interface between the 🤗 Transformers and Diffusers libraries and the different tools and libraries provided by Intel to accelerate end-to-end pipelines on Intel architectures.
 
-[Intel Extension for PyTorch](https://intel.github.io/intel-extension-for-pytorch/#introduction) is an open-source library which provides optimizations for both eager mode and graph mode, however, compared to eager mode, graph mode in PyTorch* normally yields better performance from optimization techniques, such as operation fusion.
+[Intel Extension for PyTorch](https://intel.github.io/intel-extension-for-pytorch/#introduction) is an open-source library which provides optimizations like faster attention and operators fusion.
 
 Intel [Neural Compressor](https://www.intel.com/content/www/us/en/developer/tools/oneapi/neural-compressor.html) is an open-source library enabling the usage of the most popular compression techniques such as quantization, pruning and knowledge distillation. It supports automatic accuracy-driven tuning strategies in order for users to easily generate quantized model. The users can easily apply static, dynamic and aware-training quantization approaches while giving an expected accuracy criteria. It also supports different weight pruning techniques enabling the creation of pruned model giving a predefined sparsity target.
 
@@ -72,7 +72,7 @@ Below are examples of how to use OpenVINO and its [NNCF](https://docs.openvino.a
 
 #### Export:
 
-It is possible to export your model to the [OpenVINO IR](https://docs.openvino.ai/2024/documentation/openvino-ir-format.html) format with the CLI :
+It is also possible to export your model to the [OpenVINO IR](https://docs.openvino.ai/2024/documentation/openvino-ir-format.html) format with the CLI :
 
 ```plain
 optimum-cli export openvino --model gpt2 ov_model
@@ -157,60 +157,9 @@ quantizer.quantize(ov_config=ov_config, calibration_dataset=calibration_dataset,
 optimized_model = OVModelForSequenceClassification.from_pretrained(save_dir)
 ```
 
-#### Quantization-aware training:
-
-Quantization aware training (QAT) is applied in order to simulate the effects of quantization during training, to alleviate its effects on the model’s accuracy. Here is an example on how to fine-tune a DistilBERT model on the sst-2 task while applying quantization aware training (QAT).
-
-```diff
-  import evaluate
-  import numpy as np
-  from datasets import load_dataset
-  from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainingArguments, default_data_collator
-- from transformers import Trainer
-+ from optimum.intel import OVConfig, OVModelForSequenceClassification, OVTrainer
-
-  model_id = "distilbert-base-uncased-finetuned-sst-2-english"
-  model = AutoModelForSequenceClassification.from_pretrained(model_id)
-  tokenizer = AutoTokenizer.from_pretrained(model_id)
-  dataset = load_dataset("glue", "sst2")
-  dataset = dataset.map(
-      lambda examples: tokenizer(examples["sentence"], padding=True, truncation=True, max_length=128), batched=True
-  )
-  metric = evaluate.load("glue", "sst2")
-  compute_metrics = lambda p: metric.compute(
-      predictions=np.argmax(p.predictions, axis=1), references=p.label_ids
-  )
-
-  # The directory where the quantized model will be saved
-  save_dir = "nncf_results"
-
-  # Load the default quantization configuration detailing the quantization we wish to apply
-+ ov_config = OVConfig()
-
-- trainer = Trainer(
-+ trainer = OVTrainer(
-      model=model,
-      args=TrainingArguments(save_dir, num_train_epochs=1.0, do_train=True, do_eval=True),
-      train_dataset=dataset["train"].select(range(300)),
-      eval_dataset=dataset["validation"],
-      compute_metrics=compute_metrics,
-      tokenizer=tokenizer,
-      data_collator=default_data_collator,
-+     ov_config=ov_config,
-+     task="text-classification",
-  )
-  train_result = trainer.train()
-  metrics = trainer.evaluate()
-  trainer.save_model()
-
-+ optimized_model = OVModelForSequenceClassification.from_pretrained(save_dir)
-```
-
-You can find more examples in the [documentation](https://huggingface.co/docs/optimum/intel/index).
-
 
 ## IPEX
-To load your IPEX model, you can just replace your `AutoModelForXxx` class with the corresponding `IPEXModelForXxx` class. You can set `export=True` to load a PyTorch checkpoint, export your model via TorchScript and apply IPEX optimizations : both operators optimization (replaced with customized IPEX operators) and graph-level optimization (like operators fusion) will be applied on your model.
+To load your IPEX model, you can just replace your `AutoModelForXxx` class with the corresponding `IPEXModelForXxx` class. It will load a PyTorch checkpoint, and apply IPEX operators optimization (replaced with customized IPEX operators).
 ```diff
   from transformers import AutoTokenizer, pipeline
 - from transformers import AutoModelForCausalLM
@@ -219,11 +168,10 @@ To load your IPEX model, you can just replace your `AutoModelForXxx` class with 
 
   model_id = "gpt2"
 - model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
-+ model = IPEXModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, export=True)
++ model = IPEXModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
   tokenizer = AutoTokenizer.from_pretrained(model_id)
   pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
   results = pipe("He's a dreadful magician and")
-
 ```
 
 For more details, please refer to the [documentation](https://intel.github.io/intel-extension-for-pytorch/#introduction).
@@ -231,7 +179,7 @@ For more details, please refer to the [documentation](https://intel.github.io/in
 
 ## Running the examples
 
-Check out the [`examples`](https://github.com/huggingface/optimum-intel/tree/main/examples) directory to see how 🤗 Optimum Intel can be used to optimize models and accelerate inference.
+Check out the [`examples`](https://github.com/huggingface/optimum-intel/tree/main/examples) and [`notebooks`](https://github.com/huggingface/optimum-intel/tree/main/notebooks) directory to see how 🤗 Optimum Intel can be used to optimize models and accelerate inference.
 
 Do not forget to install requirements for every example:
 

@@ -14,10 +14,8 @@
 
 import logging
 import os
-import warnings
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from typing import Dict, Optional, Union
+from typing import Optional, Union
 
 import numpy as np
 import openvino
@@ -52,11 +50,7 @@ from transformers.modeling_outputs import (
     XVectorOutput,
 )
 
-from optimum.exporters import TasksManager
-
-from ...exporters.openvino import main_export
 from ..utils.import_utils import is_timm_available, is_timm_version
-from .configuration import OVConfig, OVWeightQuantizationConfig
 from .modeling_base import OVBaseModel
 from .utils import _is_timm_ov_dir
 
@@ -129,20 +123,6 @@ class OVModel(OVBaseModel):
         # Avoid warnings when creating a transformers pipeline
         AutoConfig.register(self.base_model_prefix, AutoConfig)
         self.auto_model_class.register(AutoConfig, self.__class__)
-        self.device = torch.device("cpu")
-
-    def to(self, device: str):
-        """
-        Use the specified `device` for inference. For example: "cpu" or "gpu". `device` can
-        be in upper or lower case. To speed up first inference, call `.compile()` after `.to()`.
-        """
-        if isinstance(device, str):
-            self._device = device.upper()
-            self.request = None
-        else:
-            logger.debug(f"device must be of type {str} but got {type(device)} instead")
-
-        return self
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError
@@ -205,10 +185,9 @@ class OVModelForSequenceClassification(OVModel):
 
         # Add the token_type_ids when needed
         if "token_type_ids" in self.input_names:
-            inputs["token_type_ids"] = token_type_ids
+            inputs["token_type_ids"] = token_type_ids if token_type_ids is not None else np.zeros_like(input_ids)
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         logits = torch.from_numpy(outputs["logits"]).to(self.device) if not np_inputs else outputs["logits"]
         return SequenceClassifierOutput(logits=logits)
 
@@ -271,10 +250,9 @@ class OVModelForQuestionAnswering(OVModel):
 
         # Add the token_type_ids when needed
         if "token_type_ids" in self.input_names:
-            inputs["token_type_ids"] = token_type_ids
+            inputs["token_type_ids"] = token_type_ids if token_type_ids is not None else np.zeros_like(input_ids)
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         start_logits = (
             torch.from_numpy(outputs["start_logits"]).to(self.device) if not np_inputs else outputs["start_logits"]
         )
@@ -341,10 +319,9 @@ class OVModelForTokenClassification(OVModel):
 
         # Add the token_type_ids when needed
         if "token_type_ids" in self.input_names:
-            inputs["token_type_ids"] = token_type_ids
+            inputs["token_type_ids"] = token_type_ids if token_type_ids is not None else np.zeros_like(input_ids)
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         logits = torch.from_numpy(outputs["logits"]).to(self.device) if not np_inputs else outputs["logits"]
         return TokenClassifierOutput(logits=logits)
 
@@ -374,6 +351,13 @@ class OVModelForFeatureExtraction(OVModel):
     auto_model_class = AutoModel
 
     def __init__(self, model=None, config=None, **kwargs):
+        if {"token_embeddings", "sentence_embedding"}.issubset(
+            {name for output in model.outputs for name in output.names}
+        ):  # Sentence Transormers outputs
+            raise ValueError(
+                "This model is a Sentence Transformers model. Please use `OVSentenceTransformer` to load this model."
+            )
+
         super().__init__(model, config, **kwargs)
 
     @add_start_docstrings_to_model_forward(
@@ -406,80 +390,15 @@ class OVModelForFeatureExtraction(OVModel):
 
         # Add the token_type_ids when needed
         if "token_type_ids" in self.input_names:
-            inputs["token_type_ids"] = token_type_ids
+            inputs["token_type_ids"] = token_type_ids if token_type_ids is not None else np.zeros_like(input_ids)
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         last_hidden_state = (
             torch.from_numpy(outputs["last_hidden_state"]).to(self.device)
             if not np_inputs
             else outputs["last_hidden_state"]
         )
         return BaseModelOutput(last_hidden_state=last_hidden_state)
-
-    @classmethod
-    def _from_transformers(
-        cls,
-        model_id: str,
-        config: PretrainedConfig,
-        use_auth_token: Optional[Union[bool, str]] = None,
-        token: Optional[Union[bool, str]] = None,
-        revision: Optional[str] = None,
-        force_download: bool = False,
-        cache_dir: str = HUGGINGFACE_HUB_CACHE,
-        subfolder: str = "",
-        local_files_only: bool = False,
-        task: Optional[str] = None,
-        trust_remote_code: bool = False,
-        load_in_8bit: Optional[bool] = None,
-        quantization_config: Union[OVWeightQuantizationConfig, Dict] = None,
-        **kwargs,
-    ):
-        if use_auth_token is not None:
-            warnings.warn(
-                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
-                FutureWarning,
-            )
-            if token is not None:
-                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
-            token = use_auth_token
-
-        save_dir = TemporaryDirectory()
-        save_dir_path = Path(save_dir.name)
-        # This attribute is needed to keep one reference on the temporary directory, since garbage collecting
-        # would end-up removing the directory containing the underlying OpenVINO model
-        cls._model_save_dir_tempdirectory_instance = save_dir
-
-        # If load_in_8bit and quantization_config not specified then ov_config is set to None and will be set by default in convert depending on the model size
-        if load_in_8bit is None and not quantization_config:
-            ov_config = None
-        else:
-            ov_config = OVConfig(dtype="fp32")
-
-        # OVModelForFeatureExtraction works with Transformers type of models, thus even sentence-transformers models are loaded as such.
-        main_export(
-            model_name_or_path=model_id,
-            output=save_dir_path,
-            task=task or cls.export_feature,
-            subfolder=subfolder,
-            revision=revision,
-            cache_dir=cache_dir,
-            token=token,
-            local_files_only=local_files_only,
-            force_download=force_download,
-            trust_remote_code=trust_remote_code,
-            ov_config=ov_config,
-            library_name="transformers",
-        )
-
-        config.save_pretrained(save_dir_path)
-        return cls._from_pretrained(
-            model_id=save_dir_path,
-            config=config,
-            load_in_8bit=load_in_8bit,
-            quantization_config=quantization_config,
-            **kwargs,
-        )
 
 
 MASKED_LM_EXAMPLE = r"""
@@ -540,10 +459,9 @@ class OVModelForMaskedLM(OVModel):
 
         # Add the token_type_ids when needed
         if "token_type_ids" in self.input_names:
-            inputs["token_type_ids"] = token_type_ids
+            inputs["token_type_ids"] = token_type_ids if token_type_ids is not None else np.zeros_like(input_ids)
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         logits = torch.from_numpy(outputs["logits"]).to(self.device) if not np_inputs else outputs["logits"]
         return MaskedLMOutput(logits=logits)
 
@@ -597,7 +515,6 @@ class OVModelForImageClassification(OVModel):
         model_id: Union[str, Path],
         export: bool = False,
         config: Optional["PretrainedConfig"] = None,
-        use_auth_token: Optional[Union[bool, str]] = None,
         token: Optional[Union[bool, str]] = None,
         revision: Optional[str] = None,
         force_download: bool = False,
@@ -608,15 +525,6 @@ class OVModelForImageClassification(OVModel):
         trust_remote_code: bool = False,
         **kwargs,
     ):
-        if use_auth_token is not None:
-            warnings.warn(
-                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
-                FutureWarning,
-            )
-            if token is not None:
-                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
-            token = use_auth_token
-
         # Fix the mismatch between timm_config and huggingface_config
         local_timm_model = _is_timm_ov_dir(model_id)
         if local_timm_model or (not os.path.isdir(model_id) and model_info(model_id).library_name == "timm"):
@@ -679,8 +587,7 @@ class OVModelForImageClassification(OVModel):
             "pixel_values": pixel_values,
         }
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         logits = torch.from_numpy(outputs["logits"]).to(self.device) if not np_inputs else outputs["logits"]
         return ImageClassifierOutput(logits=logits)
 
@@ -744,8 +651,7 @@ class OVModelForAudioClassification(OVModel):
         if "attention_mask" in self.input_names:
             inputs["attention_mask"] = attention_mask
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         logits = torch.from_numpy(outputs["logits"]).to(self.device) if not np_inputs else outputs["logits"]
         return SequenceClassifierOutput(logits=logits)
 
@@ -787,7 +693,7 @@ class OVModelForCTC(OVModel):
     """
 
     auto_model_class = AutoModelForCTC
-    export_feature = TasksManager.infer_task_from_model(auto_model_class)
+    export_feature = "automatic-speech-recognition"
 
     @add_start_docstrings_to_model_forward(
         AUDIO_INPUTS_DOCSTRING.format("batch_size, sequence_length")
@@ -816,8 +722,7 @@ class OVModelForCTC(OVModel):
         if "attention_mask" in self.input_names:
             inputs["attention_mask"] = attention_mask
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         logits = torch.from_numpy(outputs["logits"]).to(self.device) if not np_inputs else outputs["logits"]
         return CausalLMOutput(logits=logits)
 
@@ -868,7 +773,7 @@ class OVModelForAudioXVector(OVModel):
     """
 
     auto_model_class = AutoModelForAudioXVector
-    export_feature = TasksManager.infer_task_from_model(auto_model_class)
+    export_feature = "audio-xvector"
 
     @add_start_docstrings_to_model_forward(
         AUDIO_INPUTS_DOCSTRING.format("batch_size, sequence_length")
@@ -897,8 +802,7 @@ class OVModelForAudioXVector(OVModel):
         if "attention_mask" in self.input_names:
             inputs["attention_mask"] = attention_mask
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         logits = torch.from_numpy(outputs["logits"]).to(self.device) if not np_inputs else outputs["logits"]
         embeddings = (
             torch.from_numpy(outputs["embeddings"]).to(self.device) if not np_inputs else outputs["embeddings"]
@@ -945,7 +849,7 @@ class OVModelForAudioFrameClassification(OVModel):
     """
 
     auto_model_class = AutoModelForAudioFrameClassification
-    export_feature = TasksManager.infer_task_from_model(auto_model_class)
+    export_feature = "audio-frame-classification"
 
     @add_start_docstrings_to_model_forward(
         AUDIO_INPUTS_DOCSTRING.format("batch_size, sequence_length")
@@ -974,8 +878,7 @@ class OVModelForAudioFrameClassification(OVModel):
         if "attention_mask" in self.input_names:
             inputs["attention_mask"] = attention_mask
 
-        # Run inference
-        outputs = self.request(inputs)
+        outputs = self._inference(inputs)
         logits = torch.from_numpy(outputs["logits"]).to(self.device) if not np_inputs else outputs["logits"]
 
         return TokenClassifierOutput(logits=logits)
@@ -1028,8 +931,7 @@ class OVModelForCustomTasks(OVModel):
         for input_name in self.input_names:
             inputs[input_name] = np.array(kwargs.pop(input_name)) if not np_inputs else kwargs.pop(input_name)
 
-        outputs = self.request(inputs)
-
+        outputs = self._inference(inputs)
         model_outputs = {}
         for key, value in outputs.items():
             key_name = next(iter(key.names))

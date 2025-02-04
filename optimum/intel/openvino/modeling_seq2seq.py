@@ -11,7 +11,6 @@
 #  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
-
 import copy
 import logging
 import os
@@ -34,13 +33,20 @@ from transformers import (
 )
 from transformers.file_utils import add_start_docstrings, add_start_docstrings_to_model_forward
 from transformers.generation import GenerationMixin
-from transformers.generation.logits_process import WhisperTimeStampLogitsProcessor
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
-from transformers.models.whisper.tokenization_whisper import TASK_IDS, TO_LANGUAGE_CODE
 
+from ...exporters.openvino.stateful import model_has_state
+from .. import OVConfig, OVQuantizer
+from ..utils import is_transformers_version
+from .configuration import OVQuantizationConfig, OVQuantizationConfigBase
 from .modeling_base_seq2seq import OVBaseModelForSeq2SeqLM
-from .utils import _print_compiled_model_properties
+from .utils import OV_TO_PT_TYPE, _print_compiled_model_properties
 
+
+if is_transformers_version(">=", "4.43.0"):
+    from transformers.cache_utils import EncoderDecoderCache
+else:
+    EncoderDecoderCache = dict
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -320,13 +326,13 @@ class OVModelForSeq2SeqLM(OVBaseModelForSeq2SeqLM, GenerationMixin):
         super().__init__(
             encoder=encoder, decoder=decoder, decoder_with_past=decoder_with_past, config=config, **kwargs
         )
-        self.device = torch.device("cpu")
+
         self.decoder_with_past = None
         enable_compilation = kwargs.get("compile", True)
         self.encoder = OVEncoder(self.encoder_model, parent_model=self)
         self.decoder = OVDecoder(self.decoder_model, parent_model=self)
 
-        if self.use_cache:
+        if self.use_cache and not model_has_state(self.decoder_model):
             self.decoder_with_past = OVDecoder(self.decoder_with_past_model, parent_model=self)
         if enable_compilation:
             self.compile()
@@ -338,18 +344,9 @@ class OVModelForSeq2SeqLM(OVBaseModelForSeq2SeqLM, GenerationMixin):
         except AttributeError:
             pass
 
-    def to(self, device: str):
-        if isinstance(device, str):
-            self._device = device.upper()
-            self.encoder._device = self._device
-            self.decoder._device = self._device
-            if self.use_cache:
-                self.decoder_with_past._device = self._device
-            self.clear_requests()
-        else:
-            logger.debug(f"device must be of type {str} but got {type(device)} instead")
-
-        return self
+    @property
+    def dtype(self) -> Optional[torch.dtype]:
+        return self.encoder.dtype or self.decoder.dtype
 
     @add_start_docstrings_to_model_forward(
         SEQ2SEQ_MODEL_DOCSTRING.format("batch_size, sequence_length")
@@ -367,6 +364,7 @@ class OVModelForSeq2SeqLM(OVBaseModelForSeq2SeqLM, GenerationMixin):
         decoder_attention_mask: Optional[torch.LongTensor] = None,
         encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Seq2SeqLMOutput:
         # Encode if needed : first prediction pass
@@ -376,10 +374,14 @@ class OVModelForSeq2SeqLM(OVBaseModelForSeq2SeqLM, GenerationMixin):
         # Decode
         if past_key_values is None or self.decoder_with_past is None:
             decoder_outputs = self.decoder(
-                input_ids=decoder_input_ids,
+                input_ids=(
+                    decoder_input_ids[:, -1:] if past_key_values is not None and self.use_cache else decoder_input_ids
+                ),
+                past_key_values=past_key_values,
                 encoder_hidden_states=encoder_outputs.last_hidden_state,
                 encoder_attention_mask=attention_mask,
                 decoder_attention_mask=decoder_attention_mask,
+                cache_position=cache_position,
             )
         else:
             decoder_outputs = self.decoder_with_past(
@@ -388,6 +390,7 @@ class OVModelForSeq2SeqLM(OVBaseModelForSeq2SeqLM, GenerationMixin):
                 encoder_hidden_states=encoder_outputs.last_hidden_state,
                 encoder_attention_mask=attention_mask,
                 decoder_attention_mask=decoder_attention_mask,
+                cache_position=cache_position,
             )
 
         return Seq2SeqLMOutput(logits=decoder_outputs.logits, past_key_values=decoder_outputs.past_key_values)
@@ -418,16 +421,8 @@ class OVModelForSeq2SeqLM(OVBaseModelForSeq2SeqLM, GenerationMixin):
     def get_encoder(self):
         return self.encoder
 
-    # Copied from transformers.models.bart.modeling_bart.BartForConditionalGeneration._reorder_cache
-    @staticmethod
-    def _reorder_cache(past, beam_idx) -> Tuple[Tuple[torch.FloatTensor]]:
-        reordered_past = ()
-        for layer_past in past:
-            # Cached cross_attention states don't have to be reordered -> they are always the same
-            reordered_past += (
-                tuple(np.take(past_state, beam_idx, 0) for past_state in layer_past[:2]) + layer_past[2:],
-            )
-        return reordered_past
+    def _reorder_cache(self, past, beam_idx) -> Tuple[Tuple[torch.FloatTensor]]:
+        return self.decoder._reorder_cache(past, beam_idx)
 
     def reshape(self, batch_size: int, sequence_length: int):
         """
@@ -439,6 +434,10 @@ class OVModelForSeq2SeqLM(OVBaseModelForSeq2SeqLM, GenerationMixin):
             sequence_length (`int`):
                 The sequence length.
         """
+        if self._compile_only:
+            raise ValueError(
+                "`reshape()` is not supported with `compile_only` mode, please intialize model without this option"
+            )
         super().reshape(batch_size, sequence_length)
         self.clear_requests()
         return self
@@ -452,15 +451,19 @@ class OVModelForSeq2SeqLM(OVBaseModelForSeq2SeqLM, GenerationMixin):
         return self
 
     def clear_requests(self):
+        if self._compile_only:
+            raise ValueError(
+                "`clear_requests()` is not supported with `compile_only` mode, please intialize model without this option"
+            )
         self.encoder.request = None
         self.decoder.request = None
-        if self.use_cache:
+        if self.decoder_with_past is not None:
             self.decoder_with_past.request = None
 
     def compile(self):
         self.encoder._compile()
         self.decoder._compile()
-        if self.use_cache:
+        if self.decoder_with_past is not None:
             self.decoder_with_past._compile()
 
 
@@ -476,11 +479,34 @@ class OVEncoder:
     def __init__(self, model: openvino.runtime.Model, parent_model: OVModelForSeq2SeqLM):
         self.model = model
         self.parent_model = parent_model
-        self._device = self.parent_model._device
-        self.device = torch.device("cpu")
+        self._comple_only = parent_model._compile_only
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
+        self.input_dtypes = {key.get_any_name(): key.get_element_type().get_type_name() for key in self.model.inputs}
+        self.output_dtypes = {key.get_any_name(): key.get_element_type().get_type_name() for key in self.model.outputs}
         self.main_input_name = self.parent_model.main_input_name or "input_ids"
-        self.request = None
+        self.request = None if not self._comple_only else self.model
+
+    @property
+    def _device(self):
+        return self.parent_model._device
+
+    @property
+    def device(self):
+        return self.parent_model.device
+
+    @property
+    def dtype(self) -> Optional[torch.dtype]:
+        for dtype in self.input_dtypes.values():
+            torch_dtype = OV_TO_PT_TYPE.get(dtype)
+            if torch_dtype.is_floating_point:
+                return torch_dtype
+
+        for dtype in self.output_dtypes.values():
+            torch_dtype = OV_TO_PT_TYPE.get(dtype)
+            if torch_dtype.is_floating_point:
+                return torch_dtype
+
+        return None
 
     @add_start_docstrings_to_model_forward(ENCODER_INPUTS_DOCSTRING)
     def forward(
@@ -523,7 +549,6 @@ class OVEncoder:
             self.request = core.compile_model(self.model, self._device, ov_config)
             # OPENVINO_LOG_LEVEL can be found in https://docs.openvino.ai/2023.2/openvino_docs_OV_UG_supported_plugins_AUTO_debugging.html
             if "OPENVINO_LOG_LEVEL" in os.environ and int(os.environ["OPENVINO_LOG_LEVEL"]) > 2:
-                logger.info(f"{self._device} SUPPORTED_PROPERTIES:")
                 _print_compiled_model_properties(self.request)
 
 
@@ -541,13 +566,18 @@ class OVDecoder:
     def __init__(self, model: openvino.runtime.Model, parent_model: OVModelForSeq2SeqLM):
         self.model = model
         self.parent_model = parent_model
-        self._device = self.parent_model._device
-        self.device = torch.device("cpu")
+        self._compile_only = parent_model._compile_only
         self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
+        self.input_dtypes = {key.get_any_name(): key.get_element_type().get_type_name() for key in self.model.inputs}
         self.key_value_input_names = [key for key in self.input_names if "key_values" in key]
         self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
+        self.output_dtypes = {key.get_any_name(): key.get_element_type().get_type_name() for key in self.model.outputs}
         self.key_value_output_names = [key for key in self.output_names if "key_values" in key or "present" in key]
+        self.stateful = model_has_state(self.model)
         is_legacy = any("past_key_values" in key.get_any_name() for key in self.model.outputs)
+        self.use_past = len(self.key_value_input_names) > 0 or self.stateful
+        self.next_beam_idx = None
+        self._past_length = 0
 
         if len(self.key_value_input_names) > 0 and not is_legacy:
             self.use_past = True
@@ -556,7 +586,29 @@ class OVDecoder:
             self.use_past = False
             self.num_pkv = 4
 
-        self.request = None
+        self.request = None if not self._compile_only else self.model.create_infer_request()
+
+    @property
+    def _device(self) -> str:
+        return self.parent_model._device
+
+    @property
+    def device(self) -> torch.device:
+        return self.parent_model.device
+
+    @property
+    def dtype(self) -> Optional[torch.dtype]:
+        for dtype in self.input_dtypes.values():
+            torch_dtype = OV_TO_PT_TYPE.get(dtype)
+            if torch_dtype.is_floating_point:
+                return torch_dtype
+
+        for dtype in self.output_dtypes.values():
+            torch_dtype = OV_TO_PT_TYPE.get(dtype)
+            if torch_dtype.is_floating_point:
+                return torch_dtype
+
+        return None
 
     @add_start_docstrings_to_model_forward(DECODER_INPUTS_DOCSTRING)
     def forward(
@@ -566,12 +618,18 @@ class OVDecoder:
         encoder_attention_mask: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         decoder_attention_mask: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> Seq2SeqLMOutput:
         self._compile()
         # Model inputs
         inputs = {}
 
-        if past_key_values is not None:
+        if self.stateful and past_key_values is None:
+            self.request.reset_state()
+            self._past_length = 0
+            self.next_beam_idx = np.arange(input_ids.shape[0], dtype=int)
+
+        if past_key_values is not None and not self.stateful:
             # Flatten the past_key_values
             past_key_values = tuple(
                 past_key_value for pkv_per_layer in past_key_values for past_key_value in pkv_per_layer
@@ -592,30 +650,53 @@ class OVDecoder:
 
         if "decoder_attention_mask" in self.input_names and decoder_attention_mask is not None:
             inputs["decoder_attention_mask"] = decoder_attention_mask
+
+        if "cache_position" in self.input_names:
+            if cache_position is None:
+                past_len = self._get_past_length(past_key_values)
+                cache_position = np.arange(past_len, past_len + input_ids.shape[1])
+            inputs["cache_position"] = cache_position
+
+        if "beam_idx" in self.input_names:
+            batch_size = input_ids.shape[0]
+            inputs["beam_idx"] = (
+                self.next_beam_idx if self.next_beam_idx is not None else np.arange(batch_size, dtype=np.int32)
+            )
         # Run inference
         self.request.start_async(inputs, share_inputs=True)
         self.request.wait()
         logits = torch.from_numpy(self.request.get_tensor("logits").data).to(self.device)
+        self._past_length += input_ids.shape[1]
 
-        # Tuple of length equal to : number of layer * number of past_key_value per decoder layer (2 corresponds to the
-        # self-attention layer and 2 to the cross-attention layer)
-        out_past_key_values = tuple(self.request.get_tensor(key).data for key in self.key_value_output_names)
+        out_past_key_values = ((),)
 
-        # Tuple of tuple of length `n_layers`, with each tuple of length equal to:
-        # * 4 for the decoder without cache (k/v of self-attention + k/v of cross-attention)
-        # * 2 for the decoder with cache (k/v of self-attention as cross-attention cache is constant)
-        if self.use_past is False:
-            out_past_key_values = tuple(
-                out_past_key_values[i : i + self.num_pkv] for i in range(0, len(out_past_key_values), self.num_pkv)
-            )
-        else:
-            # grab the cross attention key/values from the inputs
-            out_past_key_values = tuple(
-                out_past_key_values[i : i + self.num_pkv] + past_key_values[2 * i + 2 : 2 * i + 2 + self.num_pkv]
-                for i in range(0, len(out_past_key_values), self.num_pkv)
-            )
+        if not self.stateful:
+            # Tuple of length equal to : number of layer * number of past_key_value per decoder layer (2 corresponds to the
+            # self-attention layer and 2 to the cross-attention layer)
+            out_past_key_values = tuple(self.request.get_tensor(key).data for key in self.key_value_output_names)
+
+            # Tuple of tuple of length `n_layers`, with each tuple of length equal to:
+            # * 4 for the decoder without cache (k/v of self-attention + k/v of cross-attention)
+            # * 2 for the decoder with cache (k/v of self-attention as cross-attention cache is constant)
+            if self.use_past is False:
+                out_past_key_values = tuple(
+                    out_past_key_values[i : i + self.num_pkv] for i in range(0, len(out_past_key_values), self.num_pkv)
+                )
+            else:
+                # grab the cross attention key/values from the inputs
+                out_past_key_values = tuple(
+                    out_past_key_values[i : i + self.num_pkv] + past_key_values[2 * i + 2 : 2 * i + 2 + self.num_pkv]
+                    for i in range(0, len(out_past_key_values), self.num_pkv)
+                )
 
         return Seq2SeqLMOutput(logits=logits, past_key_values=out_past_key_values)
+
+    def _get_past_length(self, past_key_values=None):
+        if past_key_values is None:
+            return 0
+        if self.stateful:
+            return self._past_length
+        return past_key_values[0][0].shape[-2]
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
@@ -636,8 +717,27 @@ class OVDecoder:
             self.request = compiled_model.create_infer_request()
             # OPENVINO_LOG_LEVEL can be found in https://docs.openvino.ai/2023.2/openvino_docs_OV_UG_supported_plugins_AUTO_debugging.html
             if "OPENVINO_LOG_LEVEL" in os.environ and int(os.environ["OPENVINO_LOG_LEVEL"]) > 2:
-                logger.info(f"{self._device} SUPPORTED_PROPERTIES:")
                 _print_compiled_model_properties(compiled_model)
+
+    def _reorder_cache(
+        self, past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
+    ) -> Tuple[Tuple[torch.Tensor]]:
+        """
+        This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
+        [`~PreTrainedModel.beam_sample`] is called.
+        This is required to match `past_key_values` with the correct beam_idx at every generation step.
+        """
+        if self.stateful:
+            self.next_beam_idx = np.array(beam_idx)
+            return past_key_values
+        else:
+            reordered_past = ()
+            for layer_past in past_key_values:
+                # Cached cross_attention states don't have to be reordered -> they are always the same
+                reordered_past += (
+                    tuple(np.take(past_state, beam_idx, 0) for past_state in layer_past[:2]) + layer_past[2:],
+                )
+        return reordered_past
 
 
 @add_start_docstrings(
@@ -730,7 +830,9 @@ class OVModelForVision2Seq(OVModelForSeq2SeqLM):
             if is_decoder:
                 if inputs.get_any_name().startswith("past_key_values"):
                     shapes[inputs][2] = -1
-                elif not inputs.get_any_name().startswith("encoder"):
+                elif not inputs.get_any_name().startswith("encoder") and not inputs.get_any_name().startswith(
+                    "beam_idx"
+                ):
                     shapes[inputs][1] = -1
         model.reshape(shapes)
         return model
@@ -813,7 +915,9 @@ class OVModelForPix2Struct(OVModelForSeq2SeqLM):
             if is_decoder:
                 if inputs.get_any_name().startswith("past_key_values"):
                     shapes[inputs][2] = -1
-                elif not inputs.get_any_name().startswith("encoder"):
+                elif not inputs.get_any_name().startswith("encoder") and not inputs.get_any_name().startswith(
+                    "beam_idx"
+                ):
                     shapes[inputs][1] = -1
         model.reshape(shapes)
         return model
@@ -832,26 +936,29 @@ class OVModelForSpeechSeq2Seq(OVModelForSeq2SeqLM):
 
     def prepare_inputs_for_generation(
         self,
-        input_ids,
-        attention_mask: Optional[torch.LongTensor] = None,
-        decoder_attention_mask: Optional[torch.BoolTensor] = None,
+        decoder_input_ids,
         past_key_values=None,
+        attention_mask=None,
         head_mask=None,
         decoder_head_mask=None,
         cross_attn_head_mask=None,
         use_cache=None,
         encoder_outputs=None,
+        decoder_attention_mask=None,
         **kwargs,
-    ) -> Dict:
-        if decoder_attention_mask is None:
-            decoder_attention_mask = torch.ones_like(input_ids).to(input_ids.device)
+    ):
+        # cut decoder_input_ids if past is used
+        if past_key_values is not None:
+            decoder_input_ids = decoder_input_ids[:, -1:]
+
+        if decoder_attention_mask is None and decoder_input_ids is not None:
+            decoder_attention_mask = torch.ones_like(decoder_input_ids).to(decoder_input_ids.device)
 
         return {
-            "decoder_input_ids": input_ids,
-            "past_key_values": past_key_values,
             "encoder_outputs": encoder_outputs,
+            "past_key_values": past_key_values,
+            "decoder_input_ids": decoder_input_ids,
             "attention_mask": attention_mask,
-            "decoder_attention_mask": decoder_attention_mask,
             "head_mask": head_mask,
             "decoder_head_mask": decoder_head_mask,
             "cross_attn_head_mask": cross_attn_head_mask,
@@ -874,6 +981,7 @@ class OVModelForSpeechSeq2Seq(OVModelForSeq2SeqLM):
         decoder_attention_mask: Optional[torch.BoolTensor] = None,
         encoder_outputs: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Seq2SeqLMOutput:
         return super().forward(
@@ -883,6 +991,7 @@ class OVModelForSpeechSeq2Seq(OVModelForSeq2SeqLM):
             decoder_attention_mask=decoder_attention_mask,
             encoder_outputs=encoder_outputs,
             past_key_values=past_key_values,
+            cache_position=cache_position,
             **kwargs,
         )
 
@@ -899,431 +1008,113 @@ class OVModelForSpeechSeq2Seq(OVModelForSeq2SeqLM):
             return super()._from_pretrained(model_id, config, **kwargs)
 
 
-class _OVModelForWhisper(OVModelForSpeechSeq2Seq):
+class _OVModelForWhisper(OVModelForSpeechSeq2Seq, WhisperForConditionalGeneration):
     """
     Whisper implements its own generate() method.
     """
 
     auto_model_class = WhisperForConditionalGeneration
 
+    # force the use of the WhisperForConditionalGeneration generate and prepare_inputs_for_generation methods
+    generate = WhisperForConditionalGeneration.generate
+
     @classmethod
     def _from_pretrained(
         cls,
         model_id: Union[str, Path],
         config: "PretrainedConfig",
+        load_in_8bit: bool = False,
+        quantization_config: Union[dict, OVQuantizationConfigBase] = None,
         **kwargs,
     ):
-        return super(OVModelForSpeechSeq2Seq, cls)._from_pretrained(model_id, config, **kwargs)
+        compile_only = kwargs.get("compile_only", False)
 
-    # Adapted from transformers.models.whisper.modeling_whisper
-    def generate(
+        if not compile_only and isinstance(quantization_config, OVQuantizationConfig):
+            model = super(OVModelForSpeechSeq2Seq, cls)._from_pretrained(
+                model_id, config, load_in_8bit=False, **kwargs
+            )
+            quantization_config_copy = copy.deepcopy(quantization_config)
+            quantization_config_copy.processor = quantization_config.processor or model_id
+            OVQuantizer(model).quantize(ov_config=OVConfig(quantization_config=quantization_config_copy))
+        else:
+            model = super(OVModelForSpeechSeq2Seq, cls)._from_pretrained(
+                model_id, config, load_in_8bit=load_in_8bit, quantization_config=quantization_config, **kwargs
+            )
+
+        return model
+
+    class DummyWhisperModel:
+        def __init__(self):
+            self.encoder = self.Encoder()
+
+        class Encoder:
+            def __init__(self):
+                self.conv1 = self.Conv(stride=(1,))
+                self.conv2 = self.Conv(stride=(2,))
+
+            class Conv:
+                def __init__(self, stride):
+                    self.stride = stride
+
+    # a dummy model attribute that's used in the generate method to compute the input stride
+    # input_stride = self.model.encoder.conv1.stride[0] * self.model.encoder.conv2.stride[0]
+    model = DummyWhisperModel()
+
+    # Adopeted for stateful support from https://github.com/huggingface/transformers/blob/main/src/transformers/models/whisper/modeling_whisper.py#L1810
+    def prepare_inputs_for_generation(
         self,
-        input_features: Optional[torch.Tensor] = None,
-        generation_config=None,
-        logits_processor=None,
-        stopping_criteria=None,
-        prefix_allowed_tokens_fn=None,
-        synced_gpus=False,
-        return_timestamps=None,
-        task=None,
-        language=None,
-        is_multilingual=None,
-        prompt_ids: Optional[torch.Tensor] = None,
-        num_segment_frames: Optional[int] = None,
-        return_token_timestamps: Optional[bool] = None,
-        return_segments: bool = False,
-        attention_mask: Optional[torch.Tensor] = None,
-        time_precision: int = 0.02,
-        return_dict_in_generate: Optional[bool] = None,
+        decoder_input_ids,
+        past_key_values=None,
+        use_cache=None,
+        encoder_outputs=None,
+        attention_mask=None,
+        decoder_attention_mask=None,
+        cache_position=None,
         **kwargs,
     ):
-        if "inputs" in kwargs:
-            input_features = kwargs.pop("inputs")
-            logging.warn(
-                "The input name `inputs` is deprecated. Please make sure to use `input_features` instead.",
-                FutureWarning,
-            )
+        # Overwritten -- encoder-decoder whisper has custom logic, but it's close to the general function. Next time
+        # this function needs to be touched, let's try to sort out the commonalities between the two and remove the
+        # overwrite.
 
-        return_dict_in_generate = (
-            return_dict_in_generate
-            if return_dict_in_generate is not None
-            else self.generation_config.return_dict_in_generate
-        )
+        decoder_position_ids = None
+        if decoder_attention_mask is not None:
+            decoder_position_ids = (decoder_attention_mask.cumsum(-1) - 1).clamp(min=0)
 
-        if generation_config is None:
-            generation_config = copy.deepcopy(self.generation_config)
+        past_length = 0
+        if past_key_values is not None:
+            past_length = self.decoder._get_past_length(past_key_values)
 
-        input_stride = (
-            1 * 2
-        )  # NOTE: replaced from `self.model.encoder.conv1.stride[0] * self.model.encoder.conv2.stride[0]`
-        if num_segment_frames is None:
-            num_segment_frames = input_stride * self.config.max_source_positions
-
-        # 1. Check whether we're in shortform or longform mode
-        if input_features is not None:
-            total_input_frames = input_features.shape[-1]
-        elif "encoder_outputs" in kwargs:
-            encoder_outputs_shape = (
-                kwargs["encoder_outputs"][0].shape
-                if isinstance(kwargs["encoder_outputs"], BaseModelOutput)
-                else kwargs["encoder_outputs"].shape
-            )
-            total_input_frames = encoder_outputs_shape[1] * input_stride
-        else:
-            raise ValueError("Make sure to provide either `input_features` or `encoder_outputs` to `generate`.")
-
-        is_shortform = total_input_frames <= num_segment_frames
-
-        # 2. Make sure the generation config is correctly set depending on whether timestamps are to be returned or not
-        if return_timestamps is True:
-            if not hasattr(generation_config, "no_timestamps_token_id"):
-                raise ValueError(
-                    "You are trying to return timestamps, but the generation config is not properly set. "
-                    "Make sure to initialize the generation config with the correct attributes that are needed such as `no_timestamps_token_id`. "
-                    "For more details on how to generate the approtiate config, refer to https://github.com/huggingface/transformers/issues/21878#issuecomment-1451902363"
-                )
-            generation_config.return_timestamps = return_timestamps
-        elif not is_shortform:
-            if return_timestamps is False:
-                raise ValueError(
-                    "You have passed more than 3000 mel input features (> 30 seconds) which automatically enables long-form generation which "
-                    "requires the model to predict timestamp tokens. Please either pass `return_timestamps=True` or make sure to pass no more than 3000 mel input features."
-                )
-
-            if not hasattr(generation_config, "no_timestamps_token_id"):
-                raise ValueError(
-                    "You have passed more than 3000 mel input features (> 30 seconds) which automatically enables long-form generation which "
-                    "requires the generation config to have `no_timestamps_token_id` correctly. "
-                    "Make sure to initialize the generation config with the correct attributes that are needed such as `no_timestamps_token_id`. "
-                    "For more details on how to generate the approtiate config, refer to https://github.com/huggingface/transformers/issues/21878#issuecomment-1451902363"
-                    "or make sure to pass no more than 3000 mel input features."
-                )
-
-            logger.info("Setting `return_timestamps=True` for long-form generation.")
-            generation_config.return_timestamps = True
-        else:
-            generation_config.return_timestamps = False
-
-        # 3. Make sure to correctly set language-related parameters
-        if is_multilingual is not None:
-            if not hasattr(generation_config, "is_multilingual"):
-                raise ValueError(
-                    "The generation config is outdated and is thus not compatible with the `is_multilingual` argument "
-                    "to `generate`. Please update the generation config as per the instructions "
-                    "https://github.com/huggingface/transformers/issues/25084#issuecomment-1664398224"
-                )
-            generation_config.is_multilingual = is_multilingual
-
-        if hasattr(generation_config, "is_multilingual") and not generation_config.is_multilingual:
-            if task is not None or language is not None:
-                raise ValueError(
-                    "Cannot specify `task` or `language` for an English-only model. If the model is intended to be "
-                    "multilingual, pass `is_multilingual=True` to generate, or update the generation config."
-                )
-
-        if language is not None:
-            if not hasattr(generation_config, "lang_to_id"):
-                raise ValueError(
-                    "The generation config is outdated and is thus not compatible with the `language` argument "
-                    "to `generate`. Either set the language using the `forced_decoder_ids` in the model config, "
-                    "or update the generation config as per the instructions https://github.com/huggingface/transformers/issues/25084#issuecomment-1664398224"
-                )
-            language = language.lower()
-            generation_config.language = language
-        if task is not None:
-            if not hasattr(generation_config, "task_to_id"):
-                raise ValueError(
-                    "The generation config is outdated and is thus not compatible with the `task` argument "
-                    "to `generate`. Either set the task using the `forced_decoder_ids` in the model config, "
-                    "or update the generation config as per the instructions https://github.com/huggingface/transformers/issues/25084#issuecomment-1664398224"
-                )
-            generation_config.task = task
-
-        # 4. Add forced decoder ids depending on passed `language`, `task`,`prompt_ids`, `return_token_timestamps` and `return_timestamps`
-        forced_decoder_ids = None
-        # Legacy code for backward compatibility
-        if hasattr(self.config, "forced_decoder_ids") and self.config.forced_decoder_ids is not None:
-            forced_decoder_ids = self.config.forced_decoder_ids
-        elif (
-            hasattr(self.generation_config, "forced_decoder_ids")
-            and self.generation_config.forced_decoder_ids is not None
-        ):
-            forced_decoder_ids = self.generation_config.forced_decoder_ids
-        else:
-            forced_decoder_ids = kwargs.get("forced_decoder_ids", None)
-
-        if task is not None or language is not None or (forced_decoder_ids is None and prompt_ids is not None):
-            forced_decoder_ids = []
-            if hasattr(generation_config, "language"):
-                if generation_config.language in generation_config.lang_to_id.keys():
-                    language_token = generation_config.language
-                elif generation_config.language in TO_LANGUAGE_CODE.keys():
-                    language_token = f"<|{TO_LANGUAGE_CODE[generation_config.language]}|>"
-                elif generation_config.language in TO_LANGUAGE_CODE.values():
-                    language_token = f"<|{generation_config.language}|>"
-                else:
-                    is_language_code = len(generation_config.language) == 2
-                    raise ValueError(
-                        f"Unsupported language: {generation_config.language}. Language should be one of:"
-                        f" {list(TO_LANGUAGE_CODE.values()) if is_language_code else list(TO_LANGUAGE_CODE.keys())}."
-                    )
-                forced_decoder_ids.append((1, generation_config.lang_to_id[language_token]))
+            # Some generation methods already pass only the last input ID
+            if decoder_input_ids.shape[1] > past_length:
+                remove_prefix_length = past_length
             else:
-                forced_decoder_ids.append((1, None))  # automatically detect the language
+                # Default to old behavior: keep only final ID
+                remove_prefix_length = decoder_input_ids.shape[1] - 1
 
-            if hasattr(generation_config, "task"):
-                if generation_config.task in TASK_IDS:
-                    forced_decoder_ids.append((2, generation_config.task_to_id[generation_config.task]))
-                else:
-                    raise ValueError(
-                        f"The `{generation_config.task}`task is not supported. The task should be one of `{TASK_IDS}`"
-                    )
-            elif hasattr(generation_config, "task_to_id"):
-                forced_decoder_ids.append((2, generation_config.task_to_id["transcribe"]))  # defaults to transcribe
-            if hasattr(generation_config, "no_timestamps_token_id") and not generation_config.return_timestamps:
-                idx = forced_decoder_ids[-1][0] + 1 if forced_decoder_ids else 1
-                forced_decoder_ids.append((idx, generation_config.no_timestamps_token_id))
+            decoder_input_ids = decoder_input_ids[:, remove_prefix_length:]
 
-        if forced_decoder_ids is not None:
-            generation_config.forced_decoder_ids = forced_decoder_ids
+            if decoder_position_ids is not None:
+                decoder_position_ids = decoder_position_ids[:, remove_prefix_length:]
+                # This `clone` call is needed to avoid recapturing cuda graphs with `torch.compile`'s  `mode="reduce-overhead`, as otherwise the input `position_ids` would have various stride during the decoding. Here, simply using `.contiguous()` is not sufficient as in the batch size = 1 case, `position_ids` is already contiguous but with varying stride which retriggers a capture.
+                decoder_position_ids = decoder_position_ids.clone(memory_format=torch.contiguous_format)
 
-        if prompt_ids is not None:
-            if kwargs.get("decoder_start_token_id") is not None:
-                raise ValueError(
-                    "When specifying `prompt_ids`, you cannot also specify `decoder_start_token_id` as it gets overwritten."
-                )
-            prompt_ids = prompt_ids.tolist()
-            decoder_start_token_id, *text_prompt_ids = prompt_ids
-            # Slicing the text prompt ids in a manner consistent with the OpenAI implementation
-            # to accomodate context space for the prefix (see https://github.com/openai/whisper/blob/c09a7ae299c4c34c5839a76380ae407e7d785914/whisper/decoding.py#L599)
-            text_prompt_ids = text_prompt_ids[-self.config.max_target_positions // 2 - 1 :]
-            # Set the decoder_start_token_id to <|startofprev|>
-            kwargs.update({"decoder_start_token_id": decoder_start_token_id})
-
-            # If the user passes `max_new_tokens`, increase its number to account for the prompt
-            if kwargs.get("max_new_tokens", None) is not None:
-                kwargs["max_new_tokens"] += len(text_prompt_ids)
-                if kwargs["max_new_tokens"] >= self.config.max_target_positions:
-                    raise ValueError(
-                        f"The length of the sliced `prompt_ids` is {len(text_prompt_ids)}, and the `max_new_tokens` "
-                        f"{kwargs['max_new_tokens'] - len(text_prompt_ids)}. Thus, the combined length of the sliced "
-                        f"`prompt_ids` and `max_new_tokens` is: {kwargs['max_new_tokens']}. This exceeds the "
-                        f"`max_target_positions` of the Whisper model: {self.config.max_target_positions}. "
-                        "You should either reduce the length of your prompt, or reduce the value of `max_new_tokens`, "
-                        f"so that their combined length is less that {self.config.max_target_positions}."
-                    )
-
-            # Reformat the forced_decoder_ids to incorporate the prompt
-            non_prompt_forced_decoder_ids = (
-                kwargs.pop("forced_decoder_ids", None) or generation_config.forced_decoder_ids
+        if cache_position is None:
+            cache_position = torch.arange(
+                past_length, past_length + decoder_input_ids.shape[1], device=decoder_input_ids.device
             )
-            forced_decoder_ids = [
-                *text_prompt_ids,
-                generation_config.decoder_start_token_id,
-                *[token for _rank, token in non_prompt_forced_decoder_ids],
-            ]
-            forced_decoder_ids = [(rank + 1, token) for rank, token in enumerate(forced_decoder_ids)]
-            generation_config.forced_decoder_ids = forced_decoder_ids
+        elif use_cache:
+            cache_position = cache_position[-decoder_input_ids.shape[1] :]
 
-        if return_token_timestamps:
-            kwargs["output_attentions"] = True
-            return_dict_in_generate = True
+        # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+        # recompiles graphs as the stride of the inputs is a guard. Ref: https://github.com/huggingface/transformers/pull/29114
+        decoder_input_ids = decoder_input_ids.contiguous()
 
-            if getattr(generation_config, "task", None) == "translate":
-                logger.warning("Token-level timestamps may not be reliable for task 'translate'.")
-            if not hasattr(generation_config, "alignment_heads"):
-                raise ValueError(
-                    "Model generation config has no `alignment_heads`, token-level timestamps not available. "
-                    "See https://gist.github.com/hollance/42e32852f24243b748ae6bc1f985b13a on how to add this property to the generation config."
-                )
-
-            if kwargs.get("num_frames") is not None:
-                generation_config.num_frames = kwargs.pop("num_frames")
-
-        if generation_config.return_timestamps is True:
-            last_forced_decoder_ids = (
-                generation_config.forced_decoder_ids[-1][-1]
-                if hasattr(self.config, "forced_decoder_ids") and self.config.forced_decoder_ids
-                else None
-            )
-            if last_forced_decoder_ids == self.generation_config.no_timestamps_token_id:
-                # remove no_timestamp to be forcefully generated if we want to return timestamps
-                # this is also important to make sure `WhisperTimeStampLogitsProcessor` functions correctly
-                forced_decoder_ids = generation_config.forced_decoder_ids[:-1]
-                # Make sure that if list is empty we set it to None
-                generation_config.forced_decoder_ids = None if len(forced_decoder_ids) == 0 else forced_decoder_ids
-
-            timestamp_processor = [WhisperTimeStampLogitsProcessor(generation_config)]
-            logits_processor = (
-                timestamp_processor if logits_processor is None else timestamp_processor + logits_processor
-            )
-
-        # 5. If we're in shortform mode, simple generate the whole input at once and return the output
-        if is_shortform:
-            outputs = super().generate(
-                input_features,
-                generation_config,
-                logits_processor,
-                stopping_criteria,
-                prefix_allowed_tokens_fn,
-                synced_gpus,
-                return_dict_in_generate=return_dict_in_generate,
-                **kwargs,
-            )
-
-            if return_token_timestamps and hasattr(generation_config, "alignment_heads"):
-                num_frames = getattr(generation_config, "num_frames", None)
-                outputs["token_timestamps"] = self._extract_token_timestamps(
-                    outputs, generation_config.alignment_heads, num_frames=num_frames
-                )
-
-            return outputs
-
-        # 6. Else we're in longform mode which is more complex. We need to chunk the audio input depending on when the model generated
-        # timestamp tokens
-        # 6.1 Set running parameters for while loop
-        if not return_segments and return_dict_in_generate:
-            raise ValueError(
-                "Make sure to set `return_segments=True` to return generation outputs as part of the `'segments' key.`"
-            )
-
-        # if input is longer than 30 seconds we default to long-form generation
-        timestamp_begin = self.generation_config.no_timestamps_token_id + 1
-        # input stride is mel frames per encoder output vector which is the product of all conv strides
-        batch_size = input_features.shape[0]
-
-        if batch_size > 1 and attention_mask is None:
-            raise ValueError(
-                "When doing long-form audio transcription, make sure to pass an `attention_mask`. You can retrieve the `attention_mask` by doing `processor(audio, ..., return_attention_mask=True)` "
-            )
-        elif batch_size > 1:
-            max_frames = attention_mask.sum(-1).cpu().to(torch.long)
-            seek = torch.zeros((batch_size,), dtype=torch.long)
-        else:
-            max_frames = torch.ones((1,), dtype=torch.long) * total_input_frames
-            seek = torch.zeros((1,), dtype=torch.long)
-
-        current_segments = [[] for _ in range(batch_size)]
-        cur_to_prev_index_map = list(range(batch_size))
-
-        # batch size can decrease during the run
-        cur_bsz = prev_bsz = batch_size
-
-        # 6.2 Transcribe audio until we reach the end of all input audios
-        while (seek < max_frames).any():
-            prev_bsz = cur_bsz
-
-            # 6.3 NOTE: When in longform transcription mode and batch size > 1 we need to dynamically reduce the batch size during the loop
-            # in case one audio finished earlier than another one. Thus, we need to keep a table of "previous-index-2-current-index" in order
-            # to know which original audio is being decoded
-            new_cur_to_prev_index_map = []
-            for i in range(prev_bsz):
-                prev_i = cur_to_prev_index_map[i]
-                if seek[prev_i] >= max_frames[prev_i]:
-                    cut_index = i + (cur_bsz - prev_bsz)
-                    cur_bsz -= 1
-                    input_features = torch.cat([input_features[:cut_index], input_features[cut_index + 1 :]], dim=0)
-                else:
-                    # cut out index that goes away
-                    new_cur_to_prev_index_map.append(prev_i)
-
-            # 6.4  Set updated index map, duration of previously decoded chunks and number of max frames of current decoding chunk
-            cur_to_prev_index_map = new_cur_to_prev_index_map
-            time_offset = seek * time_precision / input_stride
-            seek_num_frames = (max_frames - seek).clamp(max=num_segment_frames)
-
-            # 6.5 Make sure that all inputs are padded to the same input length
-            segment_input = []
-            for i in range(cur_bsz):
-                prev_i = cur_to_prev_index_map[i]
-                segment_input_slice = input_features[
-                    i : i + 1, :, seek[prev_i] : seek[prev_i] + seek_num_frames[prev_i]
-                ]
-
-                if segment_input_slice.shape[-1] < num_segment_frames:
-                    # pad to 3000 if necessary
-                    segment_input_slice = torch.nn.functional.pad(
-                        segment_input_slice, pad=(0, num_segment_frames - segment_input_slice.shape[-1])
-                    )
-
-                segment_input.append(segment_input_slice)
-
-            segment_input = torch.cat(segment_input, dim=0)
-
-            # 6.6 Batch generate current chunk
-            seek_outputs = super().generate(
-                segment_input,
-                generation_config,
-                logits_processor,
-                stopping_criteria,
-                prefix_allowed_tokens_fn,
-                synced_gpus,
-                return_dict_in_generate=return_dict_in_generate,
-                **kwargs,
-            )
-
-            if return_token_timestamps and hasattr(generation_config, "alignment_heads"):
-                num_frames = getattr(generation_config, "num_frames", None)
-                seek_outputs["token_timestamps"] = self._extract_token_timestamps(
-                    seek_outputs, generation_config.alignment_heads, num_frames=num_frames
-                )
-
-            if return_dict_in_generate:
-                seek_sequences = seek_outputs["sequences"]
-                seek_outputs = [
-                    {k: v[i] for k, v in seek_outputs.items()}
-                    for i in range(next(iter(seek_outputs.values())).size(0))
-                ]
-            else:
-                seek_sequences = seek_outputs
-
-            # 6.7 Loop over each decoded audio individually as each decoding can be of a different length
-            for i, seek_sequence in enumerate(seek_sequences):
-                prev_i = cur_to_prev_index_map[i]
-
-                # make sure we cut a predicted EOS token if we are not finished with the generation yet
-                is_not_final = (seek[prev_i] + num_segment_frames) < max_frames[prev_i]
-                if is_not_final and seek_sequence[-1] == self.generation_config.eos_token_id:
-                    seek_sequence = seek_sequence[:-1]
-
-                # remove all padding tokens
-                if seek_sequence[-1] == self.generation_config.pad_token_id:
-                    num_paddings = (seek_sequence == self.generation_config.pad_token_id).sum()
-                    seek_sequence = seek_sequence[:-num_paddings]
-
-                segments, segment_offset = self._retrieve_segment(
-                    seek_sequence=seek_sequence,
-                    seek_outputs=seek_outputs,
-                    time_offset=time_offset,
-                    timestamp_begin=timestamp_begin,
-                    seek_num_frames=seek_num_frames,
-                    cur_bsz=cur_bsz,
-                    time_precision=time_precision,
-                    input_stride=input_stride,
-                    prev_idx=prev_i,
-                    idx=i,
-                )
-
-                current_segments[prev_i] += segments
-                seek[prev_i] += segment_offset
-
-        # 7. Once all segments are added to the list of all segments, called `current_segments`, we extract the predicted
-        # output tokens from the list of dicts. If we use batch size > 1, we make sure to pad the output
-        sequences = []
-        max_total_length = 0
-        for current_segment_list in current_segments:
-            sequences.append(torch.cat([d["tokens"] for d in current_segment_list], dim=-1))
-            max_total_length = max(max_total_length, len(sequences[-1]))
-
-        for i in range(batch_size):
-            sequences[i] = torch.nn.functional.pad(
-                sequences[i], pad=(0, max_total_length - len(sequences[i])), value=self.generation_config.pad_token_id
-            )
-
-        sequences = torch.stack(sequences, dim=0)
-
-        # 8. If we return all segments, the predicted output sequences are put under `"sequences"`.
-        if return_segments:
-            return {"sequences": sequences, "segments": current_segments}
-
-        return sequences
+        return {
+            "encoder_outputs": encoder_outputs,
+            "past_key_values": past_key_values,
+            "decoder_input_ids": decoder_input_ids,
+            "use_cache": use_cache,
+            "decoder_attention_mask": decoder_attention_mask,
+            "decoder_position_ids": decoder_position_ids,
+            "cache_position": cache_position,
+        }

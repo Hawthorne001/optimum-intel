@@ -34,7 +34,7 @@ from optimum.utils import NormalizedConfigManager
 
 from ..utils.constant import _TASK_ALIASES
 from ..utils.import_utils import is_torch_version
-from ..utils.modeling_utils import MULTI_QUERY_ATTN_MODELS, patch_decoder_attention_mask
+from ..utils.modeling_utils import MULTI_QUERY_ATTN_MODELS, recursive_to_device
 
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,11 @@ def prepare_jit_inputs(model: PreTrainedModel, task: str, use_cache: bool = Fals
 
     dummy_inputs = onnx_config.generate_dummy_inputs(framework="pt")
 
-    return {key: dummy_inputs[key] for key in signature.parameters if dummy_inputs.get(key, None) is not None}
+    return {
+        key: recursive_to_device(dummy_inputs[key], model.device)
+        for key in signature.parameters
+        if dummy_inputs.get(key, None) is not None
+    }
 
 
 def jit_trace(model: PreTrainedModel, task: str, use_cache: bool = False):
@@ -90,6 +94,7 @@ class BaseModelForCausalLM(OptimizedModel, GenerationMixin):
     export_feature = "text-generation"
     main_input_name = "input_ids"
     base_model_prefix = "torch_script_model"
+    _supports_cache_class = False
 
     def __init__(
         self,
@@ -372,6 +377,7 @@ class TSModelForCausalLM(BaseModelForCausalLM):
         file_name: Optional[str] = WEIGHTS_NAME,
         local_files_only: bool = False,
         use_cache: bool = True,
+        subfolder: str = None,
         **kwargs,
     ):
         if use_auth_token is not None:
@@ -401,6 +407,7 @@ class TSModelForCausalLM(BaseModelForCausalLM):
                 cache_dir=cache_dir,
                 force_download=force_download,
                 local_files_only=local_files_only,
+                subfolder=subfolder,
             )
             model_save_dir = Path(model_cache_path).parent
             model = cls.load_model(model_cache_path)
@@ -454,7 +461,6 @@ class TSModelForCausalLM(BaseModelForCausalLM):
         }
 
         model = TasksManager.get_model_from_task(task, model_id, **model_kwargs)
-        model = patch_decoder_attention_mask(model)
 
         traced_model = jit_trace(model, task, use_cache)
         save_dir = TemporaryDirectory()

@@ -15,13 +15,6 @@
 from .import_utils import DummyObject, requires_backends
 
 
-class inference_mode(metaclass=DummyObject):
-    _backends = ["ipex"]
-
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["ipex"])
-
-
 class IPEXModel(metaclass=DummyObject):
     _backends = ["ipex"]
 
@@ -77,6 +70,17 @@ class IPEXModelForCausalLM(metaclass=DummyObject):
         requires_backends(cls, ["ipex"])
 
 
+class IPEXModelForSeq2SeqLM(metaclass=DummyObject):
+    _backends = ["ipex"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["ipex"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["ipex"])
+
+
 class IPEXModelForQuestionAnswering(metaclass=DummyObject):
     _backends = ["ipex"]
 
@@ -108,3 +112,14 @@ class IPEXModelForAudioClassification(metaclass=DummyObject):
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         requires_backends(cls, ["ipex"])
+
+
+class IPEXSentenceTransformer(metaclass=DummyObject):
+    _backends = ["ipex", "sentence_transformers"]
+
+    def __init__(self, *args, **kwargs):
+        requires_backends(self, ["ipex", "sentence_transformers"])
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        requires_backends(cls, ["ipex", "sentence_transformers"])
